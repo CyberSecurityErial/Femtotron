@@ -56,6 +56,7 @@ class ActivationCheckpointWrapper(nn.Module):
         checkpoint_fn: CheckpointFn = _torch_checkpoint,
         use_reentrant: bool = False,
         preserve_rng_state: bool = False,
+        debug: bool = False,
     ) -> None:
         super().__init__()
         # 用 setattr 走 nn.Module 的正常 children 注册路径
@@ -65,6 +66,7 @@ class ActivationCheckpointWrapper(nn.Module):
         self.checkpoint_fn = checkpoint_fn
         self.use_reentrant = use_reentrant
         self.preserve_rng_state = preserve_rng_state
+        self.debug = debug
         
         # 注册 state_dict hooks,让外部看不见 wrapper 的存在
         self._register_state_dict_hook(_post_state_dict_hook)
@@ -81,7 +83,7 @@ class ActivationCheckpointWrapper(nn.Module):
             *args,
             use_reentrant=self.use_reentrant,
             preserve_rng_state=self.preserve_rng_state,
-            debug=True,
+            debug=self.debug,
             **kwargs,
         )
     

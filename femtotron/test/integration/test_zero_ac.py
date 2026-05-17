@@ -196,7 +196,7 @@ def main() -> None:
     
     num_steps = 10
     micro_batch_size = 8
-    seq_len = 32
+    seq_len = 1024
     
     # ─── 跑五个配置 ───
     configs = [

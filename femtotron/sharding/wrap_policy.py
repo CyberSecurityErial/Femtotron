@@ -7,12 +7,16 @@ def llama_wrap_policy(module: nn.Module) -> bool:
     """Llama 模型的 wrap policy:每个 transformer block 一个 unit。
     """
     # # 优先尝试 femtotron 自己的实现
-    # try:
-    #     from femtotron.parallel.tensor_parallel.linear import ColumnParallelLinear, RowParallelLinear
-    #     if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
-    #         return True
-    # except ImportError:
-    #     pass
+    try:
+        from transformers.models.llama.modeling_llama import (
+            LlamaDecoderLayer,
+            LlamaRotaryEmbedding,
+            LlamaRMSNorm,
+        )
+        if isinstance(module, (LlamaDecoderLayer, LlamaRMSNorm, LlamaRotaryEmbedding)):
+            return True
+    except ImportError:
+        pass
     
     # fallback:HuggingFace transformers 的实现
     try:

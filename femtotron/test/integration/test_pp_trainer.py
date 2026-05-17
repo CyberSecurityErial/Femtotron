@@ -133,9 +133,16 @@ def create_pp_stack(model_config, parallel_ctx, device, *, seed,
             apply_activation_checkpointing
         )
         from femtotron.scripts.presets import get_ac_policy
-        apply_activation_checkpointing(
+        n_wrapped = apply_activation_checkpointing(
             model, get_ac_policy("llama_decoder_layer"), preserve_rng_state=False,
         )
+        # if dist.get_rank() == 0:
+        #     print(f"[AC] wrapped {n_wrapped} modules")  # ← 这行
+        #     # 同时列出 wrap 了什么
+        #     for name, m in model.named_modules():
+        #         if type(m).__name__ == "ActivationCheckpointWrapper":
+        #             inner = m.inner_module
+        #             print(f"  {name} → wraps {type(inner).__name__}")
     
     # ── 6) Grad sync ──
     grad_sync = create_grad_synchronizer(mp.groups, parallel_ctx, strategy)
@@ -232,25 +239,32 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     
     world_size = dist.get_world_size()
-    assert world_size == 4, "M5b requires --nproc_per_node=4 (pp=2 × dp=2)"
+    assert world_size == 8, "M5b requires --nproc_per_node=8 (pp=2 × dp=2 × tp=2)"
     
     parallel_ctx = ParallelContext(OrderedDict([
-        ("pp", 2), ("dp", 2), ("tp", 1),
+        ("pp", 2), ("dp", 2), ("tp", 2),
     ]))
     log(f"Topology: PP={parallel_ctx.pp_size}, DP={parallel_ctx.dp_size}")
     
     model_config = AutoConfig.for_model(
         "llama",
-        hidden_size=1024, intermediate_size=2048,
-        num_attention_heads=16, num_key_value_heads=4,
+        hidden_size=2048, intermediate_size=8192,
+        num_attention_heads=32, num_key_value_heads=8,
         num_hidden_layers=8, max_position_embeddings=128,
-        vocab_size=1024, rms_norm_eps=1e-5,
+        vocab_size=40960, rms_norm_eps=1e-5,
         hidden_act="silu", tie_word_embeddings=False,
     )
     
+    # 验证 model_config 与 TP 兼容
+    assert model_config.num_attention_heads % parallel_ctx.tp_size == 0
+    assert model_config.num_key_value_heads % parallel_ctx.tp_size == 0
+    assert model_config.hidden_size % parallel_ctx.tp_size == 0
+    assert model_config.intermediate_size % parallel_ctx.tp_size == 0
+    assert model_config.vocab_size % parallel_ctx.tp_size == 0
+
     num_steps = 10
     micro_batch_size = 8     # per-DP-rank batch size
-    seq_len = 32
+    seq_len = 1024
     num_microbatches = 4
     
     configs = [
@@ -267,7 +281,7 @@ def main():
     
     results = {}
     for label, zero_stage, ac_enabled in configs:
-        log(f"\n--- PP=2, DP=2, {label} ---")
+        log(f"\n--- 3D: PP=2, DP=2, TP=2, {label} ---")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
@@ -299,43 +313,60 @@ def main():
         torch.cuda.empty_cache()
     
     
-    # ─── 总结表 ───
-    log("\n" + "=" * 80)
-    log(f"{'Config':<18} {'Peak MB':<10} {'Δloss':<10} {'vs no-AC mem':<15}")
-    log("-" * 80)
+    # # ─── 总结表 ───
+    # log("\n" + "=" * 80)
+    # log(f"{'Config':<18} {'Peak MB':<10} {'Δloss':<10} {'vs no-AC mem':<15}")
+    # log("-" * 80)
+    # for label, (losses, peak) in results.items():
+    #     delta = losses[0] - losses[-1]
+    #     if " + AC" in label:
+    #         base_label = label.replace(" + AC", "")
+    #         ac_ratio = peak / results[base_label][1] if base_label in results else None
+    #         ratio_str = f"{ac_ratio:.0%}" if ac_ratio else "-"
+    #     else:
+    #         ratio_str = "-"
+    #     log(f"{label:<18} {peak:<10.1f} {delta:<10.4f} {ratio_str:<15}")
+    # log("=" * 80)
+
+    # # ─── 验证 AC 数学等价 ───
+    # log("\nAC 数学等价性检查:")
+    # for stage in ["ZeRO-0", "ZeRO-1", "ZeRO-2", "ZeRO-3"]:
+    #     losses_no_ac = results[stage][0]
+    #     losses_ac = results[f"{stage} + AC"][0]
+    #     max_diff = max(abs(a - b) for a, b in zip(losses_no_ac, losses_ac))
+    #     status = "✓" if max_diff < 1e-2 else "✗"
+    #     log(f"  {status} {stage} vs {stage}+AC: max diff = {max_diff:.4e}")
+    #     assert max_diff < 1e-2, f"{stage} AC math broke: {max_diff}"
+
+    # # ─── 验证 AC 省内存 ───
+    # log("\nAC 内存收益:")
+    # for stage in ["ZeRO-0", "ZeRO-1", "ZeRO-2", "ZeRO-3"]:
+    #     no_ac = results[stage][1]
+    #     ac = results[f"{stage} + AC"][1]
+    #     saved = no_ac - ac
+    #     ratio = ac / no_ac
+    #     status = "✓" if saved > 0 else "○"  # 不强制要求,toy 下可能 AC overhead > savings
+    #     log(f"  {status} {stage}: {no_ac:.1f}MB → {ac:.1f}MB (省 {saved:.1f}MB = {1-ratio:.0%})")
+    
+    # ─── 总结 + 对比 ZeRO-0 / ZeRO-3 ───
+    log("\n" + "=" * 70)
+    log(f"{'Config':<18} {'Peak MB':<10} {'Δloss':<10}")
+    log("-" * 70)
     for label, (losses, peak) in results.items():
         delta = losses[0] - losses[-1]
-        if " + AC" in label:
-            base_label = label.replace(" + AC", "")
-            ac_ratio = peak / results[base_label][1] if base_label in results else None
-            ratio_str = f"{ac_ratio:.0%}" if ac_ratio else "-"
-        else:
-            ratio_str = "-"
-        log(f"{label:<18} {peak:<10.1f} {delta:<10.4f} {ratio_str:<15}")
-    log("=" * 80)
-
-    # ─── 验证 AC 数学等价 ───
-    log("\nAC 数学等价性检查:")
-    for stage in ["ZeRO-0", "ZeRO-1", "ZeRO-2", "ZeRO-3"]:
-        losses_no_ac = results[stage][0]
-        losses_ac = results[f"{stage} + AC"][0]
-        max_diff = max(abs(a - b) for a, b in zip(losses_no_ac, losses_ac))
-        status = "✓" if max_diff < 1e-2 else "✗"
-        log(f"  {status} {stage} vs {stage}+AC: max diff = {max_diff:.4e}")
-        assert max_diff < 1e-2, f"{stage} AC math broke: {max_diff}"
-
-    # ─── 验证 AC 省内存 ───
-    log("\nAC 内存收益:")
-    for stage in ["ZeRO-0", "ZeRO-1", "ZeRO-2", "ZeRO-3"]:
-        no_ac = results[stage][1]
-        ac = results[f"{stage} + AC"][1]
-        saved = no_ac - ac
-        ratio = ac / no_ac
-        status = "✓" if saved > 0 else "○"  # 不强制要求,toy 下可能 AC overhead > savings
-        log(f"  {status} {stage}: {no_ac:.1f}MB → {ac:.1f}MB (省 {saved:.1f}MB = {1-ratio:.0%})")
-
+        log(f"{label:<18} {peak:<12.6f} {delta:<12.6f}")
+    log("=" * 70)
     
-    log(f"\n✅ M5b passed")
+    # ─── 数学等价检查 ───
+    z0_losses = results["ZeRO-0"][0]
+    for label in ["ZeRO-1", "ZeRO-2", "ZeRO-3", "ZeRO-3 + AC"]:
+        losses = results[label][0]
+        max_diff = max(abs(a - b) for a, b in zip(z0_losses, losses))
+        status = "✓" if max_diff < 1e-2 else "✗"
+        log(f"  {status} ZeRO-0 vs {label}: max diff = {max_diff:.6e}")
+        assert max_diff < 1e-2, f"{label} diverged from ZeRO-0"
+    
+    log("\n✅ (3D parallel: PP + DP + TP + ZeRO + SAC) passed")
     dist.destroy_process_group()
 
 
