@@ -104,7 +104,7 @@ endif
 # 集成测试（后续开发时逐步添加）
 # ============================================================
 
-test-integration: test-dp-training test-gradient-accum test-zero1-2-3 test-zero-ac # test-tp-training test-pp-training test-3d-parallel
+test-integration: test-dp-training test-gradient-accum test-zero1-2-3 test-zero-ac test-pp-trainer # test-tp-training test-pp-training test-3d-parallel
 
 # 1.5 DDP 训练
 # test-dp-training:
@@ -141,7 +141,17 @@ else ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
 	@echo -e "$(YELLOW)>>> 测试 ZeRO + Activation Checkpointing 正确性 (2卡)$(NC)"
 	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_zero_ac.py
 endif
-	@echo -e "$(GREEN)  ZeRO-1 ✓$(NC)"
+	@echo -e "$(GREEN)  ZeRO + AC ✓$(NC)"
+
+test-pp-trainer:
+ifeq ($(shell test $(GPUS) -ge 8 && echo yes),yes)
+	@echo -e "$(YELLOW)>>> 测试 PP + TP + DP + ZeRO + SAC (8卡)$(NC)"
+	@timeout $(TIMEOUT) $(RUN_8) femtotron/test/integration/test_pp_trainer.py
+# else ifeq ($(shell test $(GPUS) -ge 2 && echo yes),yes)
+# 	@echo -e "$(YELLOW)>>> 测试 PP Trainer (2卡)$(NC)"
+# 	@timeout $(TIMEOUT) $(RUN_2) femtotron/test/integration/test_pp_trainer.py
+endif
+	@echo -e "$(GREEN)  PP + TP + DP + ZeRO + SAC ✓$(NC)"
 
 # test-tp-training:
 # 	@echo -e "$(YELLOW)>>> 测试 TP 训练一致性 (2卡)$(NC)"
