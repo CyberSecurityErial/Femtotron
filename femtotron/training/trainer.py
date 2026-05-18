@@ -244,7 +244,8 @@ class Trainer:
             steps_done = self.global_step - self._last_log_step
             tokens_per_step_per_gpu = (
                 self.dataloader.micro_batch_size
-                * self.dataloader.dataset.shape[1]   # dataset 暴露 seq_len # type:ignore
+                * self.pp_runner.num_microbatches if self.pp_runner else 1
+                * self.dataloader.dataset.seq_len
                 * self.train_config.grad_accum_steps
             )
             tps_per_gpu = tokens_per_step_per_gpu * steps_done / elapsed

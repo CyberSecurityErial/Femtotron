@@ -47,6 +47,14 @@ class PreprocessedDataset(Dataset):
         if self.seqlens is not None:
             item["seqlens"] = self.seqlens[idx]
         return item
+    
+    @property
+    def seq_len(self) -> int:
+        return self.input_ids.shape[1]
+    
+    @property
+    def num_samples(self) -> int:
+        return self.input_ids.shape[0]
 
 class PackedDataset(Dataset):
     """定长 token 序列的 dataset。

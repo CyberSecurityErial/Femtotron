@@ -26,6 +26,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from femtotron.data.data_source import PreprocessedDataset
 from femtotron.sharding.factory import create_sharding_strategy
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -55,8 +56,8 @@ from femtotron.parallel.pipeline_parallel.runner import PipelineRunner
 
 
 def init_distributed():
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    dist.init_process_group(backend="nccl", rank=local_rank, world_size=int(os.environ.get("WORLD_SIZE", 1)))
     torch.cuda.set_device(local_rank)
     return local_rank
 
@@ -410,54 +411,75 @@ def build_all(config: dict):
 
     # ─── 11. 数据 ───
     seq_len = config.get("seq_len", 128)
-    micro_batch_size = config.get("micro_batch_size", 4)
+    micro_batch_size = config.get("micro_batch_size", 1)       # PP 最小单位
+    num_microbatches = config.get("num_microbatches", 1)
     
-    # PP 校验:micro_batch_size 必须能被 num_microbatches 整除
-    if pp_size > 1:
-        assert micro_batch_size % num_microbatches == 0, (
-            f"micro_batch_size({micro_batch_size}) 必须能被 "
-            f"num_microbatches({num_microbatches}) 整除。"
-            f"每个 microbatch 的实际 batch = {micro_batch_size}/{num_microbatches}"
-        )
-        per_mb_size = micro_batch_size // num_microbatches
-        log(f"  Per-PP-microbatch size: {per_mb_size}")
+    # 用 dataclass 的 step batch(可选,但用着方便)
+    step_batch_size = micro_batch_size * num_microbatches
+    
+    log(f"  micro_batch_size:     {micro_batch_size}")
+    log(f"  num_microbatches:     {num_microbatches}")
+    log(f"  step_batch_size/DP:   {step_batch_size}")
+    
+    # ─── 数据缓存路径(包含 task/packing 自证)───
+    task    = config.get("task", "pretrain")
+    packing = config.get("packing", "concat" if task == "pretrain" else "ffd")
     
     dataset_name = config.get("dataset", "roneneldan/TinyStories")
     data_dir = config.get("data_dir", "./data")
     safe_name = dataset_name.replace("/", "_")
     safe_tok = tokenizer_name.replace("/", "_")
-    cache_path = os.path.join(data_dir, f"{safe_name}_{safe_tok}_seqlen{seq_len}.pt")
-
+    cache_path = os.path.join(
+        data_dir,
+        f"{safe_name}_{safe_tok}_seqlen{seq_len}_{task}_{packing}.pt"
+    )
+    
+    # ─── Rank 0 预处理,其他 rank 等 ───
     if dist.get_rank() == 0:
         if os.path.exists(cache_path):
             log(f"数据: 使用缓存 {cache_path}")
         else:
-            log(f"数据: 缓存不存在,开始预处理...")
+            log(f"数据: 缓存不存在,开始预处理 (task={task}, packing={packing})...")
             os.makedirs(data_dir, exist_ok=True)
             preprocess_config = PreprocessConfig(
                 dataset_name=dataset_name,
                 tokenizer_name=tokenizer_name,
                 output_path=cache_path,
                 seq_len=seq_len,
+                task=task,
+                packing=packing,
+                num_proc=config.get("preprocess_num_proc", 16),
             )
             preprocess(preprocess_config)
             log(f"数据: 预处理完成")
     dist.barrier()
-
-    train_data = torch.load(cache_path, weights_only=True)
-    log(f"数据: {train_data.shape[0]} 条样本, seq_len={train_data.shape[1]}")
-
+    
+    # ─── 所有 rank 加载(mmap)───
+    train_dataset = PreprocessedDataset(
+        cache_path,
+        mmap=True,
+        expect_task=task,   # ← meta 自证
+    )
+    log(f"数据: {len(train_dataset)} 条样本, "
+        f"seq_len={train_dataset.input_ids.shape[1]}, "
+        f"task={train_dataset.meta['task']}, "
+        f"packing={train_dataset.meta['packing']}")
+    
     dataloader = DistributedDataLoader(
-        dataset=train_data,
+        dataset=train_dataset,
         parallel_ctx=parallel_ctx,
         micro_batch_size=micro_batch_size,
-        collator=simple_pretrain_collator,
+        collator=stack_collator,
         sampler=None,
         num_workers=config.get("num_workers", 2),
     )
-
+    
     tokens_per_step = (
-        micro_batch_size * seq_len * dp_size * train_config.grad_accum_steps
+        micro_batch_size
+        * num_microbatches
+        * seq_len
+        * dp_size
+        * train_config.grad_accum_steps
     )
     log(f"  Tokens/optimizer step (全局): {tokens_per_step:,}")
 
