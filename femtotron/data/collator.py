@@ -13,6 +13,13 @@ from typing import cast, Protocol
 class Collator(Protocol):
     def __call__(self, samples: list) -> dict[str, Tensor]: ...
 
+def stack_collator(samples: list[dict]) -> dict[str, torch.Tensor]:
+    """通用 collator:全部 preprocess() 输出都用这个。"""
+    return {k: torch.stack([s[k] for s in samples]) for k in samples[0]}
+
+##############################################
+# 已经废弃的其他Collator，不要再使用
+##############################################
 def simple_pretrain_collator(
     samples: list[Tensor],
 ) -> dict[str, Tensor]:

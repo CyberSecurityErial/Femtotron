@@ -10,7 +10,7 @@ from safetensors import safe_open
 from typing import cast, Callable
 
 from femtotron.parallel_context import ParallelContext
-from femtotron.data.data_source import PackedDataset
+from femtotron.data.data_source import PreprocessedDataset
 from femtotron.data.distributed_sampler import DistributedSampler
 from femtotron.data.collator import Collator
 
@@ -41,7 +41,7 @@ class DistributedDataLoader:
     """
     
     def __init__(self, 
-                 dataset: PackedDataset,           # 继承torch风格的dataset
+                 dataset: PreprocessedDataset,           # 继承torch风格的dataset
                  parallel_ctx: ParallelContext,
                  micro_batch_size: int,  # 每个 DP rank 的 batch size
                  collator: Callable | None = None,

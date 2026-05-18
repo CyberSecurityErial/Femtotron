@@ -41,8 +41,8 @@ from femtotron.training.lr_schedule import create_lr_schedule
 from femtotron.training.trainer import Trainer
 from femtotron.training.train_config import TrainConfig, PipelineConfig
 from femtotron.data.data_loader import DistributedDataLoader
-from femtotron.data.preprocess import preprocess
-from femtotron.data.collator import Collator, simple_pretrain_collator, PadSftCollator
+from femtotron.data.preprocess import preprocess, PreprocessConfig
+from femtotron.data.collator import Collator, simple_pretrain_collator, PadSftCollator, stack_collator
 
 # ─── DP 相关 import ───
 from femtotron.parallel.data_parallel.ddp import DataParallelGradSync
@@ -434,12 +434,13 @@ def build_all(config: dict):
         else:
             log(f"数据: 缓存不存在,开始预处理...")
             os.makedirs(data_dir, exist_ok=True)
-            preprocess(
+            preprocess_config = PreprocessConfig(
                 dataset_name=dataset_name,
                 tokenizer_name=tokenizer_name,
                 output_path=cache_path,
                 seq_len=seq_len,
             )
+            preprocess(preprocess_config)
             log(f"数据: 预处理完成")
     dist.barrier()
 
