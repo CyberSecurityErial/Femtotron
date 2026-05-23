@@ -39,13 +39,14 @@ Femtotron 是一个教育导向的分布式训练框架项目。从零开始实�
 |---------|:---------:|:-------:|:--------:|
 | Tensor Parallel | ✅ | ✅ | ✅ |
 | Data Parallel | ✅ | ✅ | ✅ |
-| Pipeline Parallel | ✅ (1F1B) | ✅ (1F1B) | ✅ (1F1B) |
+| Pipeline Parallel | ✅ (1F1B, Interleaved 1F1B) | ✅ (1F1B) | ✅ (1F1B) |
 | ZeRO Stage 1 | ✅ | ❌ | ✅ |
 | ZeRO Stage 2 | ✅ | ❌ | ❌ |
 | **ZeRO Stage 3** | **✅** | **❌** | **❌** |
 | Activation Checkpointing | ✅ | ✅ | ✅ |
 | SFT | ✅ | ❌ | ✅ |
 | Context Parallel | 🔜 | ✅ | ❌ |
+| Interleaved 1F1B | ✅ | ❌ | ❌ |
 
 <!-- TODO: 如有需要可以更新对比表 -->
 
@@ -53,7 +54,6 @@ Femtotron 是一个教育导向的分布式训练框架项目。从零开始实�
 
 | Feature | 状态 |
 |---------|------|
-| Interleaved 1F1B | 🔜 计划中 |
 | Zero Bubble 调度 | 🔜 计划中 |
 | Sequence Parallel | 🔜 计划中 |
 | 通信-计算 Overlap | 🔜 计划中 |
@@ -110,6 +110,9 @@ femtotron/
 │       ├── pipeline_config.py               # PP 配置（num_microbatches, schedule 名称等）
 │       ├── runner.py                        # PipelineRunner，编排一个完整 step 的 PP 执行
 │       ├── schedule.py                      # baseline 和 1F1B 调度逻辑（warmup / steady / cooldown）
+│       ├── interleaved_partition.py         # 模型层到 PP stage 的 Interleaved 均匀或自定义分配
+│       ├── interleaved_runner.py            # PipelineRunner，编排一个完整 step 的 PP 执行
+│       ├── interleaved_schedule.py          # Interleaved 1F1B 调度逻辑（warmup / steady / cooldown）
 │       └── stage.py                         # PipelineStage，本 rank 的 forward/backward 执行
 │
 ├── sharding/
