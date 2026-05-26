@@ -265,7 +265,7 @@ make test-integration
 
 ### 峰值显存（MB）— 纯 DP 场景
 
-> PP=1, TP=1, DP=8 · H=1024, H_ff=2048, heads=16, kv_heads=4, layers=8, vocab=1024 · 变化 seq_len
+> PP=1, TP=1, DP=8 · H=1024, H_ff=2048, heads=16, kv_heads=4, layers=8, vocab=1024（72M模型） · 变化 seq_len
 
 | Config | seq=16 | seq=32 | seq=1024 |
 |--------|-------:|-------:|---------:|
@@ -277,6 +277,20 @@ make test-integration
 | ZeRO-2 + AC | 443 | 444 | 765 |
 | ZeRO-3 | 384 | 419 | 2840 |
 | **ZeRO-3 + AC** | **261** | **261** | **711** |
+
+> PP=1, TP=1, DP=8 · H=1536, H_ff=4096, heads=24, kv_heads=8, layers=20, vocab=1024（0.5B模型） · 变化 seq_len
+
+| Config          |   seq=16 |   seq=32 | seq=1024 |
+| --------------- | -------: | -------: | -------: |
+| baseline        |    11402 |    11408 |    17965 |
+| baseline + AC   |    11402 |    11409 |    11448 |
+| ZeRO-1          |     3191 |     3207 |    13020 |
+| ZeRO-1 + AC     |     3191 |     3199 |     3834 |
+| ZeRO-2          |     3062 |     3094 |    12065 |
+| ZeRO-2 + AC     |     3062 |     3100 |     3086 |
+| ZeRO-3          |     2234 |     2421 |    12299 |
+| **ZeRO-3 + AC** | **1534** | **1534** | **2241** |
+
 
 ### 峰值显存（MB）— 3D 并行场景
 

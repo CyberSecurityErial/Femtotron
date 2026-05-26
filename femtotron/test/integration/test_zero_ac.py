@@ -182,11 +182,11 @@ def main() -> None:
     # 模型配置(中等大小,能体现 AC 收益)
     model_config = AutoConfig.for_model(
         "llama",
-        hidden_size=1024,
-        intermediate_size=2048,
-        num_attention_heads=16,
-        num_key_value_heads=4,
-        num_hidden_layers=8,
+        hidden_size=1536,
+        intermediate_size=4096,
+        num_attention_heads=24,
+        num_key_value_heads=8,
+        num_hidden_layers=20,
         max_position_embeddings=128,
         vocab_size=1024,
         rms_norm_eps=1e-5,
