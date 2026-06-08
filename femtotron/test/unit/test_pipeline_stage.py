@@ -217,6 +217,89 @@ def _reset_rotary_inv_freq(rotary_emb, config, device):
     rotary_emb.inv_freq.copy_(inv_freq.to(rotary_emb.inv_freq.dtype))
     if hasattr(rotary_emb, "original_inv_freq"):
         rotary_emb.original_inv_freq.copy_(inv_freq.to(rotary_emb.original_inv_freq.dtype))
+
+
+class ToyStageModel(nn.Module):
+    """Small PipelineCausalLM-like model for Stage BW split tests."""
+
+    def __init__(self, *, is_first: bool, is_last: bool, hidden_size: int = 16, vocab_size: int = 32):
+        super().__init__()
+        self.is_first = is_first
+        self.is_last = is_last
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        if is_first:
+            self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.net = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, x, labels=None):
+        h = self.embed(x) if self.is_first else x
+        out = self.net(h)
+        if self.is_last:
+            if labels is None:
+                return {"logits": out}
+            loss = ((out.float() - labels.float()) ** 2).mean()
+            return {"loss": loss}
+        return {"hidden_states": out}
+
+
+def make_toy_model(device, *, is_first: bool, is_last: bool, seed: int = 0):
+    torch.manual_seed(seed)
+    return ToyStageModel(is_first=is_first, is_last=is_last).to(device=device)
+
+
+def assert_tensor_close(a, b, tag: str, *, atol=1e-6, rtol=1e-6):
+    torch.testing.assert_close(a, b, atol=atol, rtol=rtol, msg=tag)
+
+
+def assert_grad_dict_close(grads_a, grads_b, tag: str):
+    assert set(grads_a) == set(grads_b), (
+        f"{tag}: grad keys differ: "
+        f"only_a={set(grads_a) - set(grads_b)}, "
+        f"only_b={set(grads_b) - set(grads_a)}"
+    )
+    for name in grads_a:
+        assert_tensor_close(grads_a[name], grads_b[name], f"{tag}: {name}")
+
+
+def run_whole_stage(model, ctx, x, *, grad_out=None, labels=None):
+    stage = PipelineStage(model, ctx)
+    stage.stage_input(0, x)
+    if stage.is_last:
+        stage.stage_labels(0, labels)
+    stage.forward(0)
+    if not stage.is_last:
+        stage.stage_grad(0, grad_out)
+    stage.backward(0)
+    input_grad = None if stage.is_first else stage.get_input_grad(0)
+    losses = stage.pop_all_losses()
+    grads = clone_grads(model)
+    stage.assert_clean()
+    return input_grad, grads, losses
+
+
+def run_split_stage(model, ctx, x, *, grad_out=None, labels=None):
+    stage = PipelineStage(model, ctx)
+    stage.stage_input(0, x)
+    if stage.is_last:
+        stage.stage_labels(0, labels)
+    stage.forward(0)
+    if not stage.is_last:
+        stage.stage_grad(0, grad_out)
+    stage.backward_input_grad(0)
+    assert all(p.grad is None for p in model.parameters()), (
+        "backward_input_grad() must not populate parameter grads"
+    )
+    input_grad = None if stage.is_first else stage.get_input_grad(0)
+    stage.backward_weight_grad(0)
+    losses = stage.pop_all_losses()
+    grads = clone_grads(model)
+    stage.assert_clean()
+    return input_grad, grads, losses
 # ════════════════════════════════════════════════════════════════
 # Test 1: pp_size=1 equivalence
 # ════════════════════════════════════════════════════════════════
@@ -461,7 +544,175 @@ def test_loss_scale():
 
 
 # ════════════════════════════════════════════════════════════════
-# Test 6: error handling
+# Test 6: split backward into dgrad + wgrad
+# ════════════════════════════════════════════════════════════════
+
+def test_bw_split_middle_stage_equivalence():
+    """Middle stage: whole backward == backward_input_grad + backward_weight_grad."""
+    log("Test 6a: BW split equivalence on middle stage")
+    ctx = ParallelContext(OrderedDict([("pp", 1), ("dp", 1), ("tp", 1)]))
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    model_whole = make_toy_model(device, is_first=False, is_last=False, seed=10)
+    model_split = make_toy_model(device, is_first=False, is_last=False, seed=11)
+    model_split.load_state_dict(model_whole.state_dict())
+
+    torch.manual_seed(600)
+    x = torch.randn(2, 4, model_whole.hidden_size, device=device)
+    grad_out = torch.randn(2, 4, model_whole.hidden_size, device=device)
+
+    grad_whole, grads_whole, _ = run_whole_stage(model_whole, ctx, x, grad_out=grad_out)
+    grad_split, grads_split, _ = run_split_stage(model_split, ctx, x, grad_out=grad_out)
+
+    assert_tensor_close(grad_whole, grad_split, "middle input grad")
+    assert_grad_dict_close(grads_whole, grads_split, "middle param grads")
+    log("  ✓ middle dX and dW match whole backward")
+
+
+def test_bw_split_last_stage_equivalence():
+    """Last stage: split path matches whole backward for loss, dX, and dW."""
+    log("Test 6b: BW split equivalence on last stage")
+    ctx = ParallelContext(OrderedDict([("pp", 1), ("dp", 1), ("tp", 1)]))
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    model_whole = make_toy_model(device, is_first=False, is_last=True, seed=20)
+    model_split = make_toy_model(device, is_first=False, is_last=True, seed=21)
+    model_split.load_state_dict(model_whole.state_dict())
+
+    torch.manual_seed(610)
+    x = torch.randn(2, 4, model_whole.hidden_size, device=device)
+    labels = torch.randn(2, 4, model_whole.hidden_size, device=device)
+
+    grad_whole, grads_whole, losses_whole = run_whole_stage(model_whole, ctx, x, labels=labels)
+    grad_split, grads_split, losses_split = run_split_stage(model_split, ctx, x, labels=labels)
+
+    assert_tensor_close(losses_whole[0], losses_split[0], "last loss")
+    assert_tensor_close(grad_whole, grad_split, "last input grad")
+    assert_grad_dict_close(grads_whole, grads_split, "last param grads")
+    log("  ✓ last loss, dX, and dW match whole backward")
+
+
+def test_bw_split_first_stage_equivalence():
+    """First stage has no input grad but split path must match parameter grads."""
+    log("Test 6c: BW split equivalence on first stage")
+    ctx = ParallelContext(OrderedDict([("pp", 1), ("dp", 1), ("tp", 1)]))
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    model_whole = make_toy_model(device, is_first=True, is_last=False, seed=30)
+    model_split = make_toy_model(device, is_first=True, is_last=False, seed=31)
+    model_split.load_state_dict(model_whole.state_dict())
+
+    torch.manual_seed(620)
+    x = torch.randint(0, model_whole.vocab_size, (2, 4), device=device)
+    grad_out = torch.randn(2, 4, model_whole.hidden_size, device=device)
+
+    grad_whole, grads_whole, _ = run_whole_stage(model_whole, ctx, x, grad_out=grad_out)
+    grad_split, grads_split, _ = run_split_stage(model_split, ctx, x, grad_out=grad_out)
+
+    assert grad_whole is None and grad_split is None
+    assert_grad_dict_close(grads_whole, grads_split, "first param grads")
+    log("  ✓ first stage dW matches and no input grad is produced")
+
+
+def test_bw_split_pp1_equivalence():
+    """pp_size=1: first+last split path records loss and matches parameter grads."""
+    log("Test 6d: BW split equivalence on pp_size=1 stage")
+    ctx = ParallelContext(OrderedDict([("pp", 1), ("dp", 1), ("tp", 1)]))
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    model_whole = make_toy_model(device, is_first=True, is_last=True, seed=40)
+    model_split = make_toy_model(device, is_first=True, is_last=True, seed=41)
+    model_split.load_state_dict(model_whole.state_dict())
+
+    torch.manual_seed(630)
+    x = torch.randint(0, model_whole.vocab_size, (2, 4), device=device)
+    labels = torch.randn(2, 4, model_whole.hidden_size, device=device)
+
+    grad_whole, grads_whole, losses_whole = run_whole_stage(model_whole, ctx, x, labels=labels)
+    grad_split, grads_split, losses_split = run_split_stage(model_split, ctx, x, labels=labels)
+
+    assert grad_whole is None and grad_split is None
+    assert_tensor_close(losses_whole[0], losses_split[0], "pp1 loss")
+    assert_grad_dict_close(grads_whole, grads_split, "pp1 param grads")
+    log("  ✓ pp_size=1 loss and dW match whole backward")
+
+
+def test_bw_split_error_handling():
+    """D/W split rejects invalid ordering and leaves assert_clean coverage."""
+    log("Test 6e: BW split error handling")
+    ctx = ParallelContext(OrderedDict([("pp", 1), ("dp", 1), ("tp", 1)]))
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    def expect_error(fn, keyword):
+        try:
+            fn()
+            raise AssertionError(f"expected error with keyword '{keyword}'")
+        except RuntimeError as e:
+            assert keyword.lower() in str(e).lower(), (
+                f"error message missing '{keyword}': {e}"
+            )
+
+    torch.manual_seed(640)
+    x = torch.randn(2, 4, 16, device=device)
+    grad_out = torch.randn(2, 4, 16, device=device)
+
+    # W before D.
+    model = make_toy_model(device, is_first=False, is_last=False, seed=50)
+    stage = PipelineStage(model, ctx)
+    stage.stage_input(0, x)
+    stage.forward(0)
+    stage.stage_grad(0, grad_out)
+    expect_error(lambda: stage.backward_weight_grad(0), "dgrad")
+    stage.reset()
+
+    # D before forward.
+    model = make_toy_model(device, is_first=False, is_last=False, seed=51)
+    stage = PipelineStage(model, ctx)
+    expect_error(lambda: stage.backward_input_grad(0), "no output")
+
+    # D without downstream grad on non-last stage.
+    stage.stage_input(0, x)
+    stage.forward(0)
+    expect_error(lambda: stage.backward_input_grad(0), "grad_output")
+    stage.reset()
+
+    # Duplicate D.
+    model = make_toy_model(device, is_first=False, is_last=False, seed=52)
+    stage = PipelineStage(model, ctx)
+    stage.stage_input(0, x)
+    stage.forward(0)
+    stage.stage_grad(0, grad_out)
+    stage.backward_input_grad(0)
+    expect_error(lambda: stage.backward_input_grad(0), "already")
+    stage.reset()
+
+    # Duplicate W after a completed split backward.
+    model = make_toy_model(device, is_first=False, is_last=False, seed=53)
+    stage = PipelineStage(model, ctx)
+    stage.stage_input(0, x)
+    stage.forward(0)
+    stage.stage_grad(0, grad_out)
+    stage.backward_input_grad(0)
+    _ = stage.get_input_grad(0)
+    stage.backward_weight_grad(0)
+    expect_error(lambda: stage.backward_weight_grad(0), "dgrad")
+
+    # assert_clean catches unfinished D/W split state, including _dgrad_done.
+    model = make_toy_model(device, is_first=False, is_last=False, seed=54)
+    stage = PipelineStage(model, ctx)
+    stage.stage_input(0, x)
+    stage.forward(0)
+    stage.stage_grad(0, grad_out)
+    stage.backward_input_grad(0)
+    expect_error(lambda: stage.assert_clean(), "dgrad")
+    stage.reset()
+    stage.assert_clean()
+
+    log("  ✓ split backward error paths are explicit")
+
+
+# ════════════════════════════════════════════════════════════════
+# Test 7: error handling
 # ════════════════════════════════════════════════════════════════
 
 def test_error_handling():
@@ -600,6 +851,11 @@ def main():
         test_mid_stage_grad_flow()
         test_first_stage()
         test_loss_scale()
+        test_bw_split_middle_stage_equivalence()
+        test_bw_split_last_stage_equivalence()
+        test_bw_split_first_stage_equivalence()
+        test_bw_split_pp1_equivalence()
+        test_bw_split_error_handling()
         test_error_handling()
         test_state_management()
         log("\n[All PipelineStage tests passed ✓]")

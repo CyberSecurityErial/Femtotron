@@ -95,6 +95,7 @@ class PipelineStage:
         self._labels: dict[int, torch.Tensor] = {}
         self._pending_grad_outputs: dict[int, torch.Tensor] = {}
         self._input_grads: dict[int, torch.Tensor] = {}
+        self._dgrad_done: set[int] = set()
 
         # Loss values (detached, no graph) for last stage's logging.
         # 由 pop_all_losses() 在 train_step 末尾批量取走。
@@ -289,6 +290,119 @@ class PipelineStage:
             # 显式释放 grad buffer 引用,允许 GC
             input_tensor.grad = None
 
+    def backward_input_grad(self, mb_id: int) -> None:
+        """Run the dgrad half of backward.
+
+        Computes only the gradient with respect to this stage's input tensor.
+        Parameter gradients are intentionally not accumulated here; call
+        backward_weight_grad() afterwards to compute dW and release the graph.
+        """
+        if mb_id in self._dgrad_done:
+            raise RuntimeError(
+                f"backward_input_grad({mb_id}): dgrad already completed"
+            )
+        if mb_id not in self._outputs:
+            raise RuntimeError(
+                f"backward_input_grad({mb_id}): no output; "
+                f"call forward({mb_id}) first"
+            )
+        if mb_id not in self._inputs:
+            raise RuntimeError(
+                f"backward_input_grad({mb_id}): input missing but output exists; "
+                f"state corrupted"
+            )
+
+        output = self._outputs[mb_id]
+        input_tensor = self._inputs[mb_id]
+
+        if self.is_last:
+            if mb_id not in self._loss_values:
+                self._loss_values[mb_id] = output.detach()
+            if not self.is_first:
+                (input_grad,) = torch.autograd.grad(
+                    outputs=output,
+                    inputs=input_tensor,
+                    grad_outputs=None,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )
+                self._input_grads[mb_id] = input_grad
+        else:
+            if mb_id not in self._pending_grad_outputs:
+                raise RuntimeError(
+                    f"backward_input_grad({mb_id}): non-last stage requires "
+                    f"grad_output; call stage_grad({mb_id}) first"
+                )
+            if not self.is_first:
+                grad_output = self._pending_grad_outputs[mb_id]
+                (input_grad,) = torch.autograd.grad(
+                    outputs=output,
+                    inputs=input_tensor,
+                    grad_outputs=grad_output,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )
+                self._input_grads[mb_id] = input_grad
+
+        self._dgrad_done.add(mb_id)
+
+    def backward_weight_grad(self, mb_id: int) -> None:
+        """Run the wgrad half of backward and release per-mb graph state.
+
+        Requires backward_input_grad() to have completed first. Computes only
+        parameter gradients, manually accumulating into param.grad.
+        """
+        if mb_id not in self._dgrad_done:
+            raise RuntimeError(
+                f"backward_weight_grad({mb_id}): dgrad must run before wgrad"
+            )
+        if mb_id not in self._outputs:
+            raise RuntimeError(
+                f"backward_weight_grad({mb_id}): no output; "
+                f"call forward({mb_id}) first"
+            )
+        if mb_id not in self._inputs:
+            raise RuntimeError(
+                f"backward_weight_grad({mb_id}): input missing but output exists; "
+                f"state corrupted"
+            )
+
+        output = self._outputs[mb_id]
+        grad_output = None
+        if not self.is_last:
+            if mb_id not in self._pending_grad_outputs:
+                raise RuntimeError(
+                    f"backward_weight_grad({mb_id}): non-last stage requires "
+                    f"grad_output; call stage_grad({mb_id}) first"
+                )
+            grad_output = self._pending_grad_outputs[mb_id]
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if params:
+            grads = torch.autograd.grad(
+                outputs=output,
+                inputs=params,
+                grad_outputs=grad_output,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            for p, g in zip(params, grads):
+                if g is None:
+                    continue
+                if p.grad is None:
+                    p.grad = g
+                else:
+                    p.grad.add_(g)
+
+        self._outputs.pop(mb_id)
+        self._inputs.pop(mb_id)
+        if not self.is_last:
+            self._pending_grad_outputs.pop(mb_id)
+        self._dgrad_done.remove(mb_id)
+
     def get_input_grad(self, mb_id: int) -> torch.Tensor:
         """Retrieve input.grad for Runner's SendBackward。**Pop**。
         
@@ -337,9 +451,11 @@ class PipelineStage:
             ("_labels", self._labels),
             ("_pending_grad_outputs", self._pending_grad_outputs),
             ("_input_grads", self._input_grads),
+            ("_dgrad_done", self._dgrad_done),
         ]:
             if d:
-                leftover.append(f"  {name}: mb_ids={sorted(d.keys())}")
+                mb_ids = sorted(d.keys()) if hasattr(d, "keys") else sorted(d)
+                leftover.append(f"  {name}: mb_ids={mb_ids}")
 
         if leftover:
             raise RuntimeError(
@@ -359,4 +475,5 @@ class PipelineStage:
         self._labels.clear()
         self._pending_grad_outputs.clear()
         self._input_grads.clear()
+        self._dgrad_done.clear()
         self._loss_values.clear()
