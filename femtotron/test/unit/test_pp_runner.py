@@ -164,7 +164,7 @@ def clone_grads(model) -> dict[str, torch.Tensor]:
 def test_pp_schedule_equivalence(
     pp_size: int,
     num_microbatches: int,
-    schedule_name: str,  # "gpipe" or "1f1b"
+    schedule_name: str,  # "gpipe", "1f1b", or "zero_bubble"
 ):
     """Compare PP via Runner vs single-rank baseline.
 
@@ -295,12 +295,17 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = False  # be strict about precision
         torch.backends.cudnn.allow_tf32 = False
 
-        tests = [            # ── PP=2: existing GPipe (regression) + new 1F1B ──
+        tests = [
+            # ── PP=1: no P2P, catches Runner -> Stage split-backward dispatch ──
+            ("PP=1 ZeroBubble N=4", lambda: test_pp_schedule_equivalence(1, 4, "zero_bubble")),
+
+            # ── PP=2: existing GPipe (regression) + 1F1B + ZeroBubble ──
             ("PP=2 GPipe N=4", lambda: test_pp_schedule_equivalence(2, 4, "gpipe")),
             ("PP=2 GPipe N=1", lambda: test_pp_schedule_equivalence(2, 1, "gpipe")),
             ("PP=2 GPipe N=2", lambda: test_pp_schedule_equivalence(2, 2, "gpipe")),
             ("PP=2 1F1B  N=4", lambda: test_pp_schedule_equivalence(2, 4, "1f1b")),
             ("PP=2 1F1B  N=2", lambda: test_pp_schedule_equivalence(2, 2, "1f1b")),
+            ("PP=2 ZeroBubble N=4", lambda: test_pp_schedule_equivalence(2, 4, "zero_bubble")),
 
             # ── PP=3: first time exercising mid stage ──
             ("PP=3 GPipe N=3", lambda: test_pp_schedule_equivalence(3, 3, "gpipe")),

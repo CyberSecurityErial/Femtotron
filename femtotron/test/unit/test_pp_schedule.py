@@ -3,11 +3,15 @@
 No GPU, no distributed, no model. Just verifies the schedule structure
 for various (num_microbatches, is_first, is_last) combinations.
 """
-from femtotron.parallel.pipeline_parallel.schedule import gpipe_schedule, one_f_one_b_schedule
+from femtotron.parallel.pipeline_parallel import schedule as schedule_mod
+from femtotron.parallel.pipeline_parallel.schedule import (
+    gpipe_schedule, one_f_one_b_schedule, zero_bubble_schedule,
+)
 from collections import defaultdict
 from femtotron.parallel.pipeline_parallel.action import (
     PPAction,
     Forward, Backward,
+    BackwardInputGrad, BackwardWeightGrad,
     RecvForward, SendForward,
     RecvBackward, SendBackward,
     SendForwardRecvBackward, SendBackwardRecvForward,
@@ -279,6 +283,140 @@ def test_1f1b_compute_count_invariant():
                 assert b == num_mb, f"N={num_mb} P={pp_size} R={pp_rank}: B={b}"
     log("✓ 1F1B compute count invariant: every stage has N F's and N B's")
     
+
+def _zero_bubble_counts_and_positions(actions):
+    counts = defaultdict(int)
+    pos = defaultdict(dict)
+
+    def add(kind, mb_id, index):
+        counts[(kind, mb_id)] += 1
+        pos[kind][mb_id] = index
+
+    for i, a in enumerate(actions):
+        if isinstance(a, Forward):
+            add("f", a.mb_id, i)
+        elif isinstance(a, Backward):
+            add("b", a.mb_id, i)
+        elif isinstance(a, BackwardInputGrad):
+            add("d", a.mb_id, i)
+        elif isinstance(a, BackwardWeightGrad):
+            add("w", a.mb_id, i)
+        elif isinstance(a, RecvForward):
+            add("rf", a.mb_id, i)
+        elif isinstance(a, SendForward):
+            add("sf", a.mb_id, i)
+        elif isinstance(a, RecvBackward):
+            add("rb", a.mb_id, i)
+        elif isinstance(a, SendBackward):
+            add("sb", a.mb_id, i)
+        elif isinstance(a, SendForwardRecvBackward):
+            add("sf", a.fwd_mb, i)
+            add("rb", a.bwd_mb, i)
+        elif isinstance(a, SendBackwardRecvForward):
+            add("sb", a.bwd_mb, i)
+            add("rf", a.fwd_mb, i)
+        else:
+            raise AssertionError(f"unknown action type: {type(a).__name__}")
+
+    return counts, pos
+
+
+def _check_zero_bubble_ordering(actions, num_mb, pp_size, pp_rank, tag):
+    is_first = pp_rank == 0
+    is_last = pp_rank == pp_size - 1
+    counts, pos = _zero_bubble_counts_and_positions(actions)
+
+    expected_comm = {
+        "rf": 0 if is_first else 1,
+        "sf": 0 if is_last else 1,
+        "rb": 0 if is_last else 1,
+        "sb": 0 if is_first else 1,
+    }
+
+    for mb_id in range(num_mb):
+        assert counts[("f", mb_id)] == 1, f"{tag} mb={mb_id}: missing F"
+        assert counts[("d", mb_id)] == 1, f"{tag} mb={mb_id}: missing D"
+        assert counts[("w", mb_id)] == 1, f"{tag} mb={mb_id}: missing W"
+        assert counts[("b", mb_id)] == 0, f"{tag} mb={mb_id}: unexpected B"
+
+        for kind, want in expected_comm.items():
+            got = counts[(kind, mb_id)]
+            assert got == want, (
+                f"{tag} mb={mb_id}: {kind}={got}, expected {want}"
+            )
+
+        assert pos["f"][mb_id] < pos["d"][mb_id] < pos["w"][mb_id], (
+            f"{tag} mb={mb_id}: expected F < D < W; "
+            f"got F@{pos['f'][mb_id]} D@{pos['d'][mb_id]} W@{pos['w'][mb_id]}"
+        )
+        if not is_last:
+            assert pos["rb"][mb_id] < pos["d"][mb_id], (
+                f"{tag} mb={mb_id}: RB must precede D"
+            )
+        if not is_first:
+            assert pos["d"][mb_id] < pos["sb"][mb_id] < pos["w"][mb_id], (
+                f"{tag} mb={mb_id}: expected D < SB/SBRF < W; "
+                f"got D@{pos['d'][mb_id]} SB@{pos['sb'][mb_id]} W@{pos['w'][mb_id]}"
+            )
+
+
+def test_zero_bubble_schedule_order():
+    for pp_size in [1, 2, 3, 4]:
+        for pp_rank in range(pp_size):
+            for num_mb in [1, 2, max(4, pp_size)]:
+                actions = zero_bubble_schedule(num_mb, pp_size, pp_rank)
+                _check_zero_bubble_ordering(
+                    actions, num_mb, pp_size, pp_rank,
+                    tag=f"ZB P{pp_size}R{pp_rank}N{num_mb}",
+                )
+    log("✓ ZeroBubble order: every non-first mb satisfies D < SB/SBRF < W")
+
+
+def test_zero_bubble_action_counts():
+    comm_types = (
+        RecvForward, SendForward, RecvBackward, SendBackward,
+        SendForwardRecvBackward, SendBackwardRecvForward,
+    )
+    for pp_size in [1, 2, 3, 4]:
+        for pp_rank in range(pp_size):
+            for num_mb in [1, 2, max(4, pp_size)]:
+                base = one_f_one_b_schedule(num_mb, pp_size, pp_rank)
+                actions = zero_bubble_schedule(num_mb, pp_size, pp_rank)
+
+                assert sum(isinstance(a, Forward) for a in actions) == num_mb
+                assert sum(isinstance(a, BackwardInputGrad) for a in actions) == num_mb
+                assert sum(isinstance(a, BackwardWeightGrad) for a in actions) == num_mb
+                assert sum(isinstance(a, Backward) for a in actions) == 0
+
+                for cls in comm_types:
+                    base_count = sum(isinstance(a, cls) for a in base)
+                    zb_count = sum(isinstance(a, cls) for a in actions)
+                    assert zb_count == base_count, (
+                        f"P{pp_size}R{pp_rank}N{num_mb} {cls.__name__}: "
+                        f"zero_bubble={zb_count}, 1f1b={base_count}"
+                    )
+    log("✓ ZeroBubble counts: B split into D+W and comm actions unchanged")
+
+
+def test_zero_bubble_unmatched_pending_w_raises():
+    original_schedule = schedule_mod.one_f_one_b_schedule
+
+    def malformed_1f1b(num_microbatches, pp_size, pp_rank):
+        return [Forward(0), Backward(0)]
+
+    try:
+        schedule_mod.one_f_one_b_schedule = malformed_1f1b
+        try:
+            zero_bubble_schedule(num_microbatches=1, pp_size=2, pp_rank=1)
+        except RuntimeError as e:
+            assert "unmatched pending W actions" in str(e)
+        else:
+            raise AssertionError("Expected RuntimeError for unmatched pending W")
+    finally:
+        schedule_mod.one_f_one_b_schedule = original_schedule
+
+    log("✓ ZeroBubble rejects unmatched pending W instead of silently appending W")
+
 def main():
     tests = [
         test_pp1_degenerate,
@@ -297,6 +435,9 @@ def main():
         test_1f1b_n_less_than_p,
         test_1f1b_invalid_args,
         test_1f1b_compute_count_invariant,
+        test_zero_bubble_schedule_order,
+        test_zero_bubble_action_counts,
+        test_zero_bubble_unmatched_pending_w_raises,
     ]
     print(f"\nRunning {len(tests)} unit tests for gpipe_schedule\n")
     for t in tests:

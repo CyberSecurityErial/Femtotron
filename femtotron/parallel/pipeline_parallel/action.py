@@ -54,6 +54,24 @@ class Backward(PPAction):
         return f"B({self.mb_id})"
 
 
+@dataclass(frozen=True)
+class BackwardInputGrad(PPAction):
+    """Run dgrad half of backward: compute input grad only."""
+    mb_id: int
+
+    def __repr__(self) -> str:
+        return f"D({self.mb_id})"
+
+
+@dataclass(frozen=True)
+class BackwardWeightGrad(PPAction):
+    """Run wgrad half of backward: compute parameter grads only."""
+    mb_id: int
+
+    def __repr__(self) -> str:
+        return f"W({self.mb_id})"
+
+
 # ────────────────────────────────────────────────────────────────
 # 单向通信 actions
 # ────────────────────────────────────────────────────────────────

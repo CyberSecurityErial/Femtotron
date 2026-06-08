@@ -15,6 +15,7 @@ from __future__ import annotations
 from .action import (
     PPAction,
     Forward, Backward,
+    BackwardInputGrad, BackwardWeightGrad,
     RecvForward, SendForward,
     RecvBackward, SendBackward,
     SendForwardRecvBackward, SendBackwardRecvForward,
@@ -171,5 +172,54 @@ def one_f_one_b_schedule(
         actions.append(Backward(mb_id=bwd_mb))
         if not is_first:
             actions.append(SendBackward(mb_id=bwd_mb))
+
+    return actions
+
+
+def zero_bubble_schedule(
+    num_microbatches: int,
+    pp_size: int,
+    pp_rank: int,
+) -> list[PPAction]:
+    """Static correctness-oriented ZB-lite schedule built on top of 1F1B.
+
+    This MVP performs B/W split by replacing each Backward action with
+    BackwardInputGrad, then delays BackwardWeightGrad until after the
+    corresponding input gradient has been sent upstream. It does not try to
+    place W into real idle bubble slots, so W may still delay later F/D
+    actions. It is not ZBV, DualPipe, interleaved ZeroBubble, or an
+    ILP-optimized schedule.
+    """
+    base_actions = one_f_one_b_schedule(num_microbatches, pp_size, pp_rank)
+    is_first = pp_rank == 0
+
+    actions: list[PPAction] = []
+    pending_w: set[int] = set()
+
+    for action in base_actions:
+        if isinstance(action, Backward):
+            actions.append(BackwardInputGrad(mb_id=action.mb_id))
+            if is_first:
+                actions.append(BackwardWeightGrad(mb_id=action.mb_id))
+            else:
+                pending_w.add(action.mb_id)
+        elif isinstance(action, SendBackward):
+            actions.append(action)
+            if action.mb_id in pending_w:
+                actions.append(BackwardWeightGrad(mb_id=action.mb_id))
+                pending_w.remove(action.mb_id)
+        elif isinstance(action, SendBackwardRecvForward):
+            actions.append(action)
+            if action.bwd_mb in pending_w:
+                actions.append(BackwardWeightGrad(mb_id=action.bwd_mb))
+                pending_w.remove(action.bwd_mb)
+        else:
+            actions.append(action)
+
+    if pending_w:
+        raise RuntimeError(
+            "zero_bubble_schedule: unmatched pending W actions on "
+            f"pp_rank={pp_rank}: {sorted(pending_w)}"
+        )
 
     return actions

@@ -7,4 +7,4 @@ from torch.distributed import ProcessGroup
 @dataclass
 class PipelineConfig:
     num_microbatches: int = 1
-    schedule: str = "1f1b"   # "gpipe" or "1f1b"
+    schedule: str = "1f1b"   # "gpipe", "1f1b", "zero_bubble"/"zb"

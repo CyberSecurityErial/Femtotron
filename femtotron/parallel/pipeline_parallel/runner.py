@@ -11,11 +11,14 @@ from __future__ import annotations
 import torch
 
 from femtotron.parallel.pipeline_parallel.microbatch import split_microbatches
-from femtotron.parallel.pipeline_parallel.schedule import gpipe_schedule, one_f_one_b_schedule
+from femtotron.parallel.pipeline_parallel.schedule import (
+    gpipe_schedule, one_f_one_b_schedule, zero_bubble_schedule,
+)
 
 from .action import (
     PPAction,
     Forward, Backward,
+    BackwardInputGrad, BackwardWeightGrad,
     RecvForward, SendForward,
     RecvBackward, SendBackward,
     SendForwardRecvBackward, SendBackwardRecvForward,
@@ -37,7 +40,7 @@ class PipelineRunner:
     """
 
     def __init__(self, stage, comm, *,
-                 schedule_name: str = "1f1b",          # "gpipe" or "1f1b"
+                 schedule_name: str = "1f1b",          # "gpipe", "1f1b", "zero_bubble"/"zb"
                  num_microbatches: int = 1,
                  recv_shape: tuple[int, ...],
                  recv_dtype: torch.dtype = torch.bfloat16):
@@ -130,6 +133,10 @@ class PipelineRunner:
             self._do_forward(action.mb_id, inputs, labels)
         elif isinstance(action, Backward):
             self.stage.backward(action.mb_id)
+        elif isinstance(action, BackwardInputGrad):
+            self.stage.backward_input_grad(action.mb_id)
+        elif isinstance(action, BackwardWeightGrad):
+            self.stage.backward_weight_grad(action.mb_id)
         
         # ── Single-direction comm:caller 自己分配 buf ──
         elif isinstance(action, RecvForward):
@@ -196,5 +203,8 @@ class PipelineRunner:
                                   self.stage.is_first, self.stage.is_last)
         elif name == "1f1b":
             return one_f_one_b_schedule(self.num_microbatches,
+                                        ctx.pp_size, ctx.pp_rank)
+        elif name in ("zero_bubble", "zb"):
+            return zero_bubble_schedule(self.num_microbatches,
                                         ctx.pp_size, ctx.pp_rank)
         raise ValueError(name)
