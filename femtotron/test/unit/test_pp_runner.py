@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from transformers import LlamaConfig
-from uri_template import partial
 
 from femtotron.parallel_context import ParallelContext
 from femtotron.parallel.pipeline_parallel.comm_ops import PipelineComm

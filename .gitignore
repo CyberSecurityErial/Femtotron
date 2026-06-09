@@ -9,3 +9,5 @@ checkpoints
 data
 checkpoints/**/*
 data/**/*
+.venv/
+femtotron.egg-info/

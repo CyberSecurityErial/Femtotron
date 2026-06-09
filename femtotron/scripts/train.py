@@ -426,12 +426,14 @@ def build_all(config: dict):
     packing = config.get("packing", "concat" if task == "pretrain" else "ffd")
     
     dataset_name = config.get("dataset", "roneneldan/TinyStories")
+    num_samples = config.get("num_samples")
     data_dir = config.get("data_dir", "./data")
     safe_name = dataset_name.replace("/", "_")
     safe_tok = tokenizer_name.replace("/", "_")
+    sample_tag = f"samples{num_samples}" if num_samples is not None else "all"
     cache_path = os.path.join(
         data_dir,
-        f"{safe_name}_{safe_tok}_seqlen{seq_len}_{task}_{packing}.pt"
+        f"{safe_name}_{safe_tok}_seqlen{seq_len}_{task}_{packing}_{sample_tag}.pt"
     )
     
     # ─── Rank 0 预处理,其他 rank 等 ───
@@ -449,6 +451,7 @@ def build_all(config: dict):
                 task=task,
                 packing=packing,
                 num_proc=config.get("preprocess_num_proc", 16),
+                num_samples=num_samples,
             )
             preprocess(preprocess_config)
             log(f"数据: 预处理完成")

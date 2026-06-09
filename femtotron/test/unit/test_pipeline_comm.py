@@ -41,7 +41,6 @@ def get_device():
 def make_comm(parallel_ctx, dtype=torch.bfloat16):
     return PipelineComm(
         parallel_ctx=parallel_ctx,
-        microbatch_size=2,
         seqlen=8,
         hidden_size=16,
         dtype=dtype,
@@ -151,17 +150,6 @@ def test_buffer_validation(ctx, comm):
     log("Test 4: buffer validation")
 
     if not comm.is_first_stage:
-        # Wrong shape
-        bad_shape = torch.empty(
-            (comm.act_shape[0], comm.act_shape[1], comm.act_shape[2] + 1),
-            dtype=comm.dtype, device="cuda",
-        )
-        try:
-            comm.recv_forward(out=bad_shape)
-            assert False, "expected ValueError on wrong shape"
-        except ValueError as e:
-            assert "shape" in str(e)
-
         # Wrong dtype
         bad_dtype = torch.empty(comm.act_shape, dtype=torch.float32, device="cuda")
         try:

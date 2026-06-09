@@ -231,6 +231,7 @@ class PreprocessConfig:
     # Common
     seq_len: int = 4096
     num_proc: int = 16
+    num_samples: int | None = None
     ignore_index: int = -100
     
     # Task selection
@@ -269,7 +270,8 @@ def preprocess(cfg: PreprocessConfig) -> dict:
     统一预处理入口。
     """
     # 1. Load
-    raw = load_dataset(cfg.dataset_name, split="train")
+    split = "train" if cfg.num_samples is None else f"train[:{cfg.num_samples}]"
+    raw = load_dataset(cfg.dataset_name, split=split)
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
     
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
@@ -313,7 +315,8 @@ def preprocess(cfg: PreprocessConfig) -> dict:
     output = {
         **packed,
         "meta": {
-            **{k: v for k, v in asdict(cfg).items() if k not in ("output_path",)},
+            **{k: v for k, v in asdict(cfg).items() if k not in ("output_path", "num_samples")},
+            "requested_num_samples": cfg.num_samples,
             "num_samples":  int(packed["input_ids"].shape[0]),
             "total_tokens": int(packed["input_ids"].numel()),
             "pad_token_id": pad_id,

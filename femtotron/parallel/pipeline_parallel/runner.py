@@ -103,6 +103,7 @@ class PipelineRunner:
             - Stage state is clean (asserted) — safe to call run() again
             - No optimizer.step() or grad sync has happened
         """
+        # TODO: stage name need is a general thing
         if self.stage.is_first and microbatch_inputs is None:
             raise ValueError(
                 "First stage requires microbatch_inputs dict; got None"
@@ -139,6 +140,7 @@ class PipelineRunner:
             self.stage.backward_weight_grad(action.mb_id)
         
         # ── Single-direction comm:caller 自己分配 buf ──
+        # TODO: add memtracker
         elif isinstance(action, RecvForward):
             buf = torch.empty(recv_shape, dtype=recv_dtype, device=self._device)
             self.comm.recv_forward(out=buf)
