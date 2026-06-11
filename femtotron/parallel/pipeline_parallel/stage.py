@@ -5,23 +5,23 @@ PipelineStage:single-rank execution unit for pipeline parallelism.
 
 持有:
     - model (PipelineCausalLM protocol:is_first/is_last/forward(x, labels=None))
-    - per-microbatch tensor state(keyed by mb_id)
+    - per-microbatch tensor state(keyed by MicrobatchKey: legacy int mb_id or TaskKey)
 
 不持有 / 不知道:
     - Schedule (action 顺序由 Runner 决定)
     - Comm (P2P 由 Runner 调用)
-    - mb_id 的语义(只是 dict key)
+    - MicrobatchKey 的语义(只是 opaque dict key)
 
 Lifecycle for one microbatch on a non-first non-last stage:
-    1. Runner: stage_input(mb_id, x_from_comm)
+    1. Runner: stage_input(mb, x_from_comm)
        Stage: detach + requires_grad_(True),cache in _inputs
-    2. Runner: forward(mb_id)
+    2. Runner: forward(mb)
        Stage: model(x) → cache output in _outputs
-    3. Runner: get_output(mb_id) → send via comm
-    4. Runner: stage_grad(mb_id, g_from_comm) → cache in _pending_grad_outputs
-    5. Runner: backward(mb_id)
+    3. Runner: get_output(mb) → send via comm
+    4. Runner: stage_grad(mb, g_from_comm) → cache in _pending_grad_outputs
+    5. Runner: backward(mb)
        Stage: pop input/output/grad,output.backward(grad),cache input.grad in _input_grads
-    6. Runner: get_input_grad(mb_id) → send via comm
+    6. Runner: get_input_grad(mb) → send via comm
 
 边界 stage:
     - First stage:跳过 step 1 的 requires_grad,跳过 step 5b/6(没有 input grad)
@@ -30,17 +30,33 @@ Lifecycle for one microbatch on a non-first non-last stage:
 
 Rigor invariants:
     - 每个 cache entry 都有明确的 owner-pops-it lifecycle
-    - 错误的调用顺序触发 RuntimeError(带 mb_id + method 信息)
+    - 错误的调用顺序触发 RuntimeError(带 mb + method 信息)
     - assert_clean() 在 train_step 末尾检测残留,catch schedule bug
     - 无 silent fallback(没有 default=None 兜底)
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import torch
 from torch import nn
 
 from femtotron.parallel_context import ParallelContext
+from femtotron.parallel.pipeline_parallel.scheduler.ir import TaskKey
+
+
+MicrobatchKey = int | TaskKey
+
+
+def _format_microbatch_key(mb: MicrobatchKey) -> str:
+    if isinstance(mb, TaskKey):
+        return f"TaskKey({mb.short()})"
+    return str(mb)
+
+
+def _format_microbatch_keys(mbs: Iterable[MicrobatchKey]) -> list[str]:
+    return sorted(_format_microbatch_key(mb) for mb in mbs)
 
 
 class PipelineStage:
@@ -88,24 +104,24 @@ class PipelineStage:
         self.is_first: bool = bool(model.is_first)
         self.is_last: bool = bool(model.is_last)
 
-        # Per-microbatch state (mb_id -> tensor)
+        # Per-microbatch state (MicrobatchKey -> tensor)
         # 每个字典的 owner-pops-it 责任见各方法 docstring
-        self._inputs: dict[int, torch.Tensor] = {}
-        self._outputs: dict[int, torch.Tensor] = {}
-        self._labels: dict[int, torch.Tensor] = {}
-        self._pending_grad_outputs: dict[int, torch.Tensor] = {}
-        self._input_grads: dict[int, torch.Tensor] = {}
-        self._dgrad_done: set[int] = set()
+        self._inputs: dict[MicrobatchKey, torch.Tensor] = {}
+        self._outputs: dict[MicrobatchKey, torch.Tensor] = {}
+        self._labels: dict[MicrobatchKey, torch.Tensor] = {}
+        self._pending_grad_outputs: dict[MicrobatchKey, torch.Tensor] = {}
+        self._input_grads: dict[MicrobatchKey, torch.Tensor] = {}
+        self._dgrad_done: set[MicrobatchKey] = set()
 
         # Loss values (detached, no graph) for last stage's logging.
         # 由 pop_all_losses() 在 train_step 末尾批量取走。
-        self._loss_values: dict[int, torch.Tensor] = {}
+        self._loss_values: dict[MicrobatchKey, torch.Tensor] = {}
 
     # ════════════════════════════════════════════════════════════════
     # Input staging
     # ════════════════════════════════════════════════════════════════
 
-    def stage_input(self, mb_id: int, x: torch.Tensor) -> None:
+    def stage_input(self, mb: MicrobatchKey, x: torch.Tensor) -> None:
         """Cache input for forward.
 
         Non-first stage:
@@ -116,52 +132,54 @@ class PipelineStage:
         First stage:
             - x 通常是 LongTensor input_ids,不做 requires_grad 处理
         """
-        if mb_id in self._inputs:
+        mb_s = _format_microbatch_key(mb)
+        if mb in self._inputs:
             raise RuntimeError(
-                f"stage_input({mb_id}): input already staged; "
+                f"stage_input({mb_s}): input already staged; "
                 f"schedule bug or missing reset()"
             )
 
         if not self.is_first:
             if x.grad_fn is not None:
                 raise RuntimeError(
-                    f"stage_input({mb_id}): non-first stage expects leaf tensor "
+                    f"stage_input({mb_s}): non-first stage expects leaf tensor "
                     f"(grad_fn=None), got grad_fn={x.grad_fn}. "
                     f"Comm.recv_forward should return leaf tensors."
                 )
             if not x.dtype.is_floating_point:
                 raise TypeError(
-                    f"stage_input({mb_id}): non-first stage expects float input "
+                    f"stage_input({mb_s}): non-first stage expects float input "
                     f"(hidden_states), got dtype={x.dtype}"
                 )
             # Non-destructive:新 leaf 共享 storage,caller 的 x 属性不变
             x = x.detach()
             x.requires_grad_(True)
 
-        self._inputs[mb_id] = x
+        self._inputs[mb] = x
 
-    def stage_labels(self, mb_id: int, labels: torch.Tensor) -> None:
+    def stage_labels(self, mb: MicrobatchKey, labels: torch.Tensor) -> None:
         """Cache labels(last stage only)。
         
         Runner 在 train_step 开头给 last stage 准备所有 microbatch 的 labels,
-        forward(mb_id) 时被 pop 消费。
+        forward(mb) 时被 pop 消费。
         """
+        mb_s = _format_microbatch_key(mb)
         if not self.is_last:
             raise RuntimeError(
-                f"stage_labels({mb_id}): only valid on last stage "
+                f"stage_labels({mb_s}): only valid on last stage "
                 f"(is_last={self.is_last})"
             )
-        if mb_id in self._labels:
+        if mb in self._labels:
             raise RuntimeError(
-                f"stage_labels({mb_id}): labels already staged"
+                f"stage_labels({mb_s}): labels already staged"
             )
-        self._labels[mb_id] = labels
+        self._labels[mb] = labels
 
     # ════════════════════════════════════════════════════════════════
     # Forward
     # ════════════════════════════════════════════════════════════════
 
-    def forward(self, mb_id: int) -> None:
+    def forward(self, mb: MicrobatchKey) -> None:
         """Run model.forward;cache output in _outputs。
 
         Last stage with labels:
@@ -172,25 +190,26 @@ class PipelineStage:
         Forward 成功完成后才修改 cache:如果 model.forward 抛异常,
         _inputs/_labels 不动,reset() 可以干净恢复。
         """
-        if mb_id not in self._inputs:
+        mb_s = _format_microbatch_key(mb)
+        if mb not in self._inputs:
             raise RuntimeError(
-                f"forward({mb_id}): no input staged; call stage_input({mb_id}) first"
+                f"forward({mb_s}): no input staged; call stage_input({mb_s}) first"
             )
-        if mb_id in self._outputs:
+        if mb in self._outputs:
             raise RuntimeError(
-                f"forward({mb_id}): output already exists (duplicate forward?)"
+                f"forward({mb_s}): output already exists (duplicate forward?)"
             )
 
-        x = self._inputs[mb_id]
+        x = self._inputs[mb]
 
         if self.is_last:
-            if mb_id not in self._labels:
+            if mb not in self._labels:
                 raise RuntimeError(
-                    f"forward({mb_id}): last stage requires labels; "
-                    f"call stage_labels({mb_id}) first"
+                    f"forward({mb_s}): last stage requires labels; "
+                    f"call stage_labels({mb_s}) first"
                 )
             # peek,在 model 成功 forward 后才 pop(失败时 labels 不丢)
-            labels = self._labels.pop(mb_id, None)
+            labels = self._labels.pop(mb, None)
         else:
             labels = None
 
@@ -205,119 +224,123 @@ class PipelineStage:
                     scaled = loss * self.loss_scale
                 else:
                     scaled = loss
-                self._outputs[mb_id] = scaled
+                self._outputs[mb] = scaled
             else:
                 # 推理模式:存 logits,backward 不会被调用
-                self._outputs[mb_id] = output_dict["logits"]
+                self._outputs[mb] = output_dict["logits"]
         else:
             # 中间/首段 stage:存 hidden_states,等接收 grad_output
-            self._outputs[mb_id] = output_dict["hidden_states"]
+            self._outputs[mb] = output_dict["hidden_states"]
 
-    def get_output(self, mb_id: int) -> torch.Tensor:
+    def get_output(self, mb: MicrobatchKey) -> torch.Tensor:
         """Retrieve output for Runner's SendForward。**不 pop**(backward 时 pop)。"""
-        if mb_id not in self._outputs:
+        mb_s = _format_microbatch_key(mb)
+        if mb not in self._outputs:
             raise RuntimeError(
-                f"get_output({mb_id}): no output cached; call forward({mb_id}) first"
+                f"get_output({mb_s}): no output cached; call forward({mb_s}) first"
             )
-        return self._outputs[mb_id]
+        return self._outputs[mb]
 
     # ════════════════════════════════════════════════════════════════
     # Backward
     # ════════════════════════════════════════════════════════════════
 
-    def stage_grad(self, mb_id: int, grad: torch.Tensor) -> None:
+    def stage_grad(self, mb: MicrobatchKey, grad: torch.Tensor) -> None:
         """Cache grad_output(from downstream stage)for backward。
         
         Last stage 不需要(backward 起点是内部 loss)。
         """
+        mb_s = _format_microbatch_key(mb)
         if self.is_last:
             raise RuntimeError(
-                f"stage_grad({mb_id}): last stage doesn't accept external grad "
+                f"stage_grad({mb_s}): last stage doesn't accept external grad "
                 f"(backward starts from internal loss)"
             )
-        if mb_id in self._pending_grad_outputs:
+        if mb in self._pending_grad_outputs:
             raise RuntimeError(
-                f"stage_grad({mb_id}): grad already staged"
+                f"stage_grad({mb_s}): grad already staged"
             )
-        self._pending_grad_outputs[mb_id] = grad
+        self._pending_grad_outputs[mb] = grad
 
-    def backward(self, mb_id: int) -> None:
+    def backward(self, mb: MicrobatchKey) -> None:
         """Run backward。
 
-        Pops: _outputs[mb_id], _inputs[mb_id], _pending_grad_outputs[mb_id](non-last)
-        Pushes: _input_grads[mb_id](non-first), _loss_values[mb_id](last)
+        Pops: _outputs[mb], _inputs[mb], _pending_grad_outputs[mb](non-last)
+        Pushes: _input_grads[mb](non-first), _loss_values[mb](last)
         Side effect: param.grad 累加,autograd graph 释放(retain_graph=False)
         """
-        if mb_id not in self._outputs:
+        mb_s = _format_microbatch_key(mb)
+        if mb not in self._outputs:
             raise RuntimeError(
-                f"backward({mb_id}): no output; call forward({mb_id}) first"
+                f"backward({mb_s}): no output; call forward({mb_s}) first"
             )
-        if mb_id not in self._inputs:
+        if mb not in self._inputs:
             # Shouldn't happen if forward succeeded;防御性检查
             raise RuntimeError(
-                f"backward({mb_id}): input missing but output exists; state corrupted"
+                f"backward({mb_s}): input missing but output exists; state corrupted"
             )
 
-        output = self._outputs.pop(mb_id)
-        input_tensor = self._inputs.pop(mb_id)
+        output = self._outputs.pop(mb)
+        input_tensor = self._inputs.pop(mb)
 
         if self.is_last:
             # 保留 loss value(detach 掉 graph)给 Runner 收集
-            self._loss_values[mb_id] = output.detach()
+            self._loss_values[mb] = output.detach()
             # Scalar loss:backward without grad_output arg
             output.backward()
         else:
-            if mb_id not in self._pending_grad_outputs:
+            if mb not in self._pending_grad_outputs:
                 raise RuntimeError(
-                    f"backward({mb_id}): non-last stage requires grad_output; "
-                    f"call stage_grad({mb_id}) first"
+                    f"backward({mb_s}): non-last stage requires grad_output; "
+                    f"call stage_grad({mb_s}) first"
                 )
-            grad_output = self._pending_grad_outputs.pop(mb_id)
+            grad_output = self._pending_grad_outputs.pop(mb)
             output.backward(grad_output)
 
         # 提取 input.grad 给上游(non-first stage)
         if not self.is_first:
             if input_tensor.grad is None:
                 raise RuntimeError(
-                    f"backward({mb_id}): input.grad is None on non-first stage. "
+                    f"backward({mb_s}): input.grad is None on non-first stage. "
                     f"Possible causes:\n"
                     f"  - model.forward 没真正用到 input(layer_range 错配?)\n"
                     f"  - input 不是 leaf 或 requires_grad=False(stage_input 哪里出错?)\n"
                     f"  - retain_graph 相关问题\n"
                     f"This is a correctness bug; upstream would receive None."
                 )
-            self._input_grads[mb_id] = input_tensor.grad
+            self._input_grads[mb] = input_tensor.grad
             # 显式释放 grad buffer 引用,允许 GC
             input_tensor.grad = None
 
-    def backward_input_grad(self, mb_id: int) -> None:
+    def backward_input_grad(self, mb: MicrobatchKey) -> None:
         """Run the dgrad half of backward.
 
         Computes only the gradient with respect to this stage's input tensor.
         Parameter gradients are intentionally not accumulated here; call
         backward_weight_grad() afterwards to compute dW and release the graph.
         """
-        if mb_id in self._dgrad_done:
+        mb_s = _format_microbatch_key(mb)
+        if mb in self._dgrad_done:
             raise RuntimeError(
-                f"backward_input_grad({mb_id}): dgrad already completed"
+                f"backward_input_grad({mb_s}): dgrad already completed"
             )
-        if mb_id not in self._outputs:
+        if mb not in self._outputs:
             raise RuntimeError(
-                f"backward_input_grad({mb_id}): no output; "
-                f"call forward({mb_id}) first"
+                f"backward_input_grad({mb_s}): no output; "
+                f"call forward({mb_s}) first"
             )
-        if mb_id not in self._inputs:
+        if mb not in self._inputs:
             raise RuntimeError(
-                f"backward_input_grad({mb_id}): input missing but output exists; "
+                f"backward_input_grad({mb_s}): input missing but output exists; "
                 f"state corrupted"
             )
 
-        output = self._outputs[mb_id]
-        input_tensor = self._inputs[mb_id]
+        output = self._outputs[mb]
+        input_tensor = self._inputs[mb]
 
         if self.is_last:
-            if mb_id not in self._loss_values:
-                self._loss_values[mb_id] = output.detach()
+            if mb not in self._loss_values:
+                self._loss_values[mb] = output.detach()
             if not self.is_first:
                 (input_grad,) = torch.autograd.grad(
                     outputs=output,
@@ -327,15 +350,15 @@ class PipelineStage:
                     create_graph=False,
                     allow_unused=False,
                 )
-                self._input_grads[mb_id] = input_grad
+                self._input_grads[mb] = input_grad
         else:
-            if mb_id not in self._pending_grad_outputs:
+            if mb not in self._pending_grad_outputs:
                 raise RuntimeError(
-                    f"backward_input_grad({mb_id}): non-last stage requires "
-                    f"grad_output; call stage_grad({mb_id}) first"
+                    f"backward_input_grad({mb_s}): non-last stage requires "
+                    f"grad_output; call stage_grad({mb_s}) first"
                 )
             if not self.is_first:
-                grad_output = self._pending_grad_outputs[mb_id]
+                grad_output = self._pending_grad_outputs[mb]
                 (input_grad,) = torch.autograd.grad(
                     outputs=output,
                     inputs=input_tensor,
@@ -344,40 +367,41 @@ class PipelineStage:
                     create_graph=False,
                     allow_unused=False,
                 )
-                self._input_grads[mb_id] = input_grad
+                self._input_grads[mb] = input_grad
 
-        self._dgrad_done.add(mb_id)
+        self._dgrad_done.add(mb)
 
-    def backward_weight_grad(self, mb_id: int) -> None:
+    def backward_weight_grad(self, mb: MicrobatchKey) -> None:
         """Run the wgrad half of backward and release per-mb graph state.
 
         Requires backward_input_grad() to have completed first. Computes only
         parameter gradients, manually accumulating into param.grad.
         """
-        if mb_id not in self._dgrad_done:
+        mb_s = _format_microbatch_key(mb)
+        if mb not in self._dgrad_done:
             raise RuntimeError(
-                f"backward_weight_grad({mb_id}): dgrad must run before wgrad"
+                f"backward_weight_grad({mb_s}): dgrad must run before wgrad"
             )
-        if mb_id not in self._outputs:
+        if mb not in self._outputs:
             raise RuntimeError(
-                f"backward_weight_grad({mb_id}): no output; "
-                f"call forward({mb_id}) first"
+                f"backward_weight_grad({mb_s}): no output; "
+                f"call forward({mb_s}) first"
             )
-        if mb_id not in self._inputs:
+        if mb not in self._inputs:
             raise RuntimeError(
-                f"backward_weight_grad({mb_id}): input missing but output exists; "
+                f"backward_weight_grad({mb_s}): input missing but output exists; "
                 f"state corrupted"
             )
 
-        output = self._outputs[mb_id]
+        output = self._outputs[mb]
         grad_output = None
         if not self.is_last:
-            if mb_id not in self._pending_grad_outputs:
+            if mb not in self._pending_grad_outputs:
                 raise RuntimeError(
-                    f"backward_weight_grad({mb_id}): non-last stage requires "
-                    f"grad_output; call stage_grad({mb_id}) first"
+                    f"backward_weight_grad({mb_s}): non-last stage requires "
+                    f"grad_output; call stage_grad({mb_s}) first"
                 )
-            grad_output = self._pending_grad_outputs[mb_id]
+            grad_output = self._pending_grad_outputs[mb]
 
         params = [p for p in self.model.parameters() if p.requires_grad]
         if params:
@@ -397,37 +421,38 @@ class PipelineStage:
                 else:
                     p.grad.add_(g)
 
-        self._outputs.pop(mb_id)
-        self._inputs.pop(mb_id)
+        self._outputs.pop(mb)
+        self._inputs.pop(mb)
         if not self.is_last:
-            self._pending_grad_outputs.pop(mb_id)
-        self._dgrad_done.remove(mb_id)
+            self._pending_grad_outputs.pop(mb)
+        self._dgrad_done.remove(mb)
 
-    def get_input_grad(self, mb_id: int) -> torch.Tensor:
+    def get_input_grad(self, mb: MicrobatchKey) -> torch.Tensor:
         """Retrieve input.grad for Runner's SendBackward。**Pop**。
         
         First stage 没有 upstream,调用是错误。
         """
+        mb_s = _format_microbatch_key(mb)
         if self.is_first:
             raise RuntimeError(
-                f"get_input_grad({mb_id}): first stage has no upstream"
+                f"get_input_grad({mb_s}): first stage has no upstream"
             )
-        if mb_id not in self._input_grads:
+        if mb not in self._input_grads:
             raise RuntimeError(
-                f"get_input_grad({mb_id}): no input_grad cached; "
-                f"call backward({mb_id}) first"
+                f"get_input_grad({mb_s}): no input_grad cached; "
+                f"call backward({mb_s}) first"
             )
-        return self._input_grads.pop(mb_id)
+        return self._input_grads.pop(mb)
 
     # ════════════════════════════════════════════════════════════════
     # Loss collection (last stage only)
     # ════════════════════════════════════════════════════════════════
 
-    def pop_all_losses(self) -> dict[int, torch.Tensor]:
+    def pop_all_losses(self) -> dict[MicrobatchKey, torch.Tensor]:
         """Return all loss values and clear buffer。
         
         Returns:
-            dict[mb_id, scalar_loss_tensor],non-last stage 返回空 dict。
+            dict[mb, scalar_loss_tensor],non-last stage 返回空 dict。
             Tensor 是 detached(no graph),可以放心 .item() 或 mean。
         """
         losses = self._loss_values
@@ -454,8 +479,12 @@ class PipelineStage:
             ("_dgrad_done", self._dgrad_done),
         ]:
             if d:
-                mb_ids = sorted(d.keys()) if hasattr(d, "keys") else sorted(d)
-                leftover.append(f"  {name}: mb_ids={mb_ids}")
+                mbs = (
+                    _format_microbatch_keys(d.keys())
+                    if hasattr(d, "keys")
+                    else _format_microbatch_keys(d)
+                )
+                leftover.append(f"  {name}: mbs={mbs}")
 
         if leftover:
             raise RuntimeError(
